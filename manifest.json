@@ -1,0 +1,22 @@
+{
+  "name": "ParkingBays-AttributeManager",
+  "label": "Modify Parking Bay Attributes",
+  "type": "widget",
+  "version": "1.14.0",
+  "exbVersion": "1.14.0",
+  "author": "Cam Cooper",
+  "description": "Modify current parking bay attributes by writing superseding AttributeTransactions rows.",
+  "copyright": "",
+  "license": "http://www.apache.org/licenses/LICENSE-2.0",
+  "properties": {},
+  "dependency": [
+    "jimu-arcgis"
+  ],
+  "translatedLocales": [
+    "en"
+  ],
+  "defaultSize": {
+    "width": 420,
+    "height": 700
+  }
+}
