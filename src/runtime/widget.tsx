@@ -9,7 +9,7 @@ import {
   type JimuMapView
 } from 'jimu-arcgis'
 
-import { buildModificationTransactionPlan, pollGpRebuild, queryCurrentAttributeRowsByFeatureUid, submitAttributeTransactionPlan, submitGpRebuild, type AttributeTransactionRow } from './lib/transaction-helpers'
+import { buildModificationTransactionPlan, buildResolvedModificationTransactionPlan, pollGpRebuild, queryCurrentAttributeRowsByFeatureUid, submitAttributeTransactionPlan, submitGpRebuild, type AttributeTransactionPlan, type AttributeTransactionRow, type ResolvedAttributeTransactionValues } from './lib/transaction-helpers'
 import { escapeSqlValue, firstValue, formatEpochAsDateInput, getRecordAttributes, getTodayDateInputValue, parseDateInputToEpoch } from './lib/field-helpers'
 
 const { useEffect, useMemo, useRef, useState } = React
@@ -19,6 +19,7 @@ const STATUS_OPTIONS = [
   'Closed (Temporary)',
   'Closed (Permanent)'
 ]
+const BATCH_STATUS_DO_NOT_CHANGE = '__DO_NOT_CHANGE__'
 
 interface HighlightHandle {
   remove: () => void
@@ -41,7 +42,19 @@ interface MatchingMapContext {
   jsApiLayer: any
 }
 
-const WIDGET_VERSION = 'v2026.05.13-1.2'
+interface BatchSelectionSummary {
+  selectedCount: number
+  includedCount: number
+  excludedCount: number
+  excludedClosedCount: number
+  noCurrentAttributeCount: number
+  includedFeatureUids: string[]
+  missingCurrentAttributeFeatureUids: string[]
+}
+
+type BatchSelectionContextType = 'parking-lot' | 'map'
+
+const WIDGET_VERSION = 'v2026.05.17-1.4'
 
 const ACTIVE_LAYER_MATCH_HINTS = [
   'parkingbaystest_spatialtransactions_active',
@@ -71,6 +84,49 @@ const buildBayLabel = (bay: ActiveBayOption): string => {
 
   return labelParts.join(' - ')
 }
+const getNormalisedText = (value: string | null | undefined): string => {
+  return String(value || '').trim()
+}
+const getSharedValueOrBlank = (values: string[]): string => {
+  const uniqueValues = Array.from(new Set(values.map((value) => value.trim())))
+
+  return uniqueValues.length === 1 ? uniqueValues[0] : ''
+}
+const buildBatchSelectionSummary = (
+  selectedFeatureUids: string[],
+  currentRowsByFeatureUid: { [key: string]: AttributeTransactionRow },
+  excludeClosedBays: boolean
+): BatchSelectionSummary => {
+  const includedFeatureUids: string[] = []
+  const missingCurrentAttributeFeatureUids: string[] = []
+  let excludedClosedCount = 0
+
+  for (const featureUid of selectedFeatureUids) {
+    const currentRow = currentRowsByFeatureUid[featureUid]
+
+    if (!currentRow) {
+      missingCurrentAttributeFeatureUids.push(featureUid)
+      continue
+    }
+
+    if (excludeClosedBays && getNormalisedText(currentRow.status) !== 'Open') {
+      excludedClosedCount += 1
+      continue
+    }
+
+    includedFeatureUids.push(featureUid)
+  }
+
+  return {
+    selectedCount: selectedFeatureUids.length,
+    includedCount: includedFeatureUids.length,
+    excludedCount: selectedFeatureUids.length - includedFeatureUids.length,
+    excludedClosedCount,
+    noCurrentAttributeCount: missingCurrentAttributeFeatureUids.length,
+    includedFeatureUids,
+    missingCurrentAttributeFeatureUids
+  }
+}
 
 const Widget = (props: AllWidgetProps<any>) => {
   const [activeBayDs, setActiveBayDs] = useState<DataSource | null>(null)
@@ -79,6 +135,12 @@ const Widget = (props: AllWidgetProps<any>) => {
   const [activeBays, setActiveBays] = useState<ActiveBayOption[]>([])
   const [selectedBuilding, setSelectedBuilding] = useState('')
   const [selectedFeatureUid, setSelectedFeatureUid] = useState('')
+  const [selectionMode, setSelectionMode] = useState<'single' | 'batch'>('single')
+  const [batchSelectedFeatureUids, setBatchSelectedFeatureUids] = useState<string[]>([])
+  const [batchCurrentRowsByFeatureUid, setBatchCurrentRowsByFeatureUid] = useState<{ [key: string]: AttributeTransactionRow }>({})
+  const [batchSelectionContextType, setBatchSelectionContextType] = useState<BatchSelectionContextType>('parking-lot')
+  const [batchSelectionContextLabel, setBatchSelectionContextLabel] = useState('')
+  const [batchMissingFeatureUidCount, setBatchMissingFeatureUidCount] = useState(0)
   const [currentAttributeRow, setCurrentAttributeRow] = useState<AttributeTransactionRow | null>(null)
 
   const [baytype, setBaytype] = useState('')
@@ -89,10 +151,13 @@ const Widget = (props: AllWidgetProps<any>) => {
   })
   const [amendReason, setAmendReason] = useState('')
   const [notes, setNotes] = useState('')
+  const [excludeClosedBays, setExcludeClosedBays] = useState(false)
+  const [clearNoteFromTransaction, setClearNoteFromTransaction] = useState(false)
   const [showDebug, setShowDebug] = useState(false)
 
   const [isLoadingBays, setIsLoadingBays] = useState(false)
   const [isLoadingCurrentRow, setIsLoadingCurrentRow] = useState(false)
+  const [isLoadingBatchSelection, setIsLoadingBatchSelection] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
 
   const [loadError, setLoadError] = useState('')
@@ -138,6 +203,7 @@ const Widget = (props: AllWidgetProps<any>) => {
     setValidFrom(getTodayDateInputValue())
     setAmendReason('')
     setNotes('')
+    setClearNoteFromTransaction(false)
   }
 
   const applyCurrentRowToForm = (row: AttributeTransactionRow) => {
@@ -148,6 +214,25 @@ const Widget = (props: AllWidgetProps<any>) => {
     setValidFrom(getTodayDateInputValue())
     setAmendReason('')
     setNotes(row.notes || '')
+    setClearNoteFromTransaction(false)
+  }
+  const clearBatchSelection = () => {
+    setBatchSelectedFeatureUids([])
+    setBatchCurrentRowsByFeatureUid({})
+    setBatchSelectionContextType('parking-lot')
+    setBatchSelectionContextLabel('')
+    setBatchMissingFeatureUidCount(0)
+    setIsLoadingBatchSelection(false)
+  }
+  const applyBatchRowsToForm = (rows: AttributeTransactionRow[]) => {
+    setCurrentAttributeRow(null)
+    setBaytype(getSharedValueOrBlank(rows.map((row) => getNormalisedText(row.baytype))))
+    setStatus(getSharedValueOrBlank(rows.map((row) => getNormalisedText(row.status))))
+    setParkaidZone(getSharedValueOrBlank(rows.map((row) => getNormalisedText(row.parkaidZone))))
+    setValidFrom(getTodayDateInputValue())
+    setAmendReason('')
+    setNotes(getSharedValueOrBlank(rows.map((row) => getNormalisedText(row.notes))))
+    setClearNoteFromTransaction(false)
   }
 
   const getMatchingMapContext = (): MatchingMapContext | null => {
@@ -417,6 +502,13 @@ const Widget = (props: AllWidgetProps<any>) => {
   const selectedBay = useMemo(() => {
     return activeBays.find((item) => item.featureUid === selectedFeatureUid) || null
   }, [activeBays, selectedFeatureUid])
+  const batchSelectionSummary = useMemo(() => {
+    return buildBatchSelectionSummary(
+      batchSelectedFeatureUids,
+      batchCurrentRowsByFeatureUid,
+      excludeClosedBays
+    )
+  }, [batchSelectedFeatureUids, batchCurrentRowsByFeatureUid, excludeClosedBays])
 
   const currentRowSummaryItems = useMemo(() => {
     if (!currentAttributeRow) {
@@ -434,8 +526,10 @@ const Widget = (props: AllWidgetProps<any>) => {
   }, [currentAttributeRow])
 
   const handleBuildingChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+    setSelectionMode('single')
     setSelectedBuilding(event.target.value)
     setSelectedFeatureUid('')
+    clearBatchSelection()
     clearMessages()
     resetFormForSelectedBay()
   }
@@ -450,6 +544,8 @@ const Widget = (props: AllWidgetProps<any>) => {
 
     const isSameFeature = selectedFeatureUid === trimmedFeatureUid
 
+    setSelectionMode('single')
+    clearBatchSelection()
     clearMessages()
     setLoadError('')
     resetFormForSelectedBay()
@@ -466,6 +562,8 @@ const Widget = (props: AllWidgetProps<any>) => {
     const matchingBay = activeBays.find((item) => item.featureUid === nextFeatureUid)
 
     if (!matchingBay) {
+      setSelectionMode('single')
+      clearBatchSelection()
       setSelectedFeatureUid(nextFeatureUid)
       clearMessages()
       resetFormForSelectedBay()
@@ -490,35 +588,277 @@ const Widget = (props: AllWidgetProps<any>) => {
       return
     }
 
-    if (selectedRecords.length > 1) {
-      clearMessages()
-      setLiveStatus('Multiple selected bays are not supported yet. v1 only supports one selected bay.')
+    const selectedMapTargets: Array<{ featureUid: string, building: string }> = []
+    let missingFeatureUidCount = 0
+
+    for (const selectedRecord of selectedRecords) {
+      const selectedRecordAttributes = getRecordAttributes(selectedRecord)
+      const selectedFeatureUidFromMap = firstValue(selectedRecordAttributes, ['feature_uid', 'FEATURE_UID'])
+      const selectedBuildingFromMap = firstValue(selectedRecordAttributes, ['building', 'BUILDING'])
+      const matchingLoadedBay = activeBays.find((item) => item.featureUid === selectedFeatureUidFromMap)
+
+      const resolvedFeatureUid = matchingLoadedBay?.featureUid || selectedFeatureUidFromMap
+      const resolvedBuilding = matchingLoadedBay?.building || selectedBuildingFromMap
+
+      if (resolvedFeatureUid === '') {
+        missingFeatureUidCount += 1
+        continue
+      }
+
+      selectedMapTargets.push({
+        featureUid: resolvedFeatureUid,
+        building: resolvedBuilding
+      })
+    }
+
+    if (selectedRecords.length === 1) {
+      const selectedMapTarget = selectedMapTargets[0]
+
+      if (!selectedMapTarget) {
+        clearMessages()
+        setLiveStatus('The selected map feature does not provide feature_uid.')
+        return
+      }
+
+      if (selectedMapTarget.building === '') {
+        clearMessages()
+        setLiveStatus(`The selected map feature for feature_uid ${selectedMapTarget.featureUid} does not provide the Parking Lot value needed by the dropdown path.`)
+        return
+      }
+
+      activateTargetBay(selectedMapTarget.featureUid, selectedMapTarget.building)
+      setLiveStatus(`Selected bay loaded from map: ${selectedMapTarget.featureUid}`)
+      appendDebugLine(`Map-selected bay loaded. feature_uid=${selectedMapTarget.featureUid}`)
       return
     }
 
-    const selectedRecordAttributes = getRecordAttributes(selectedRecords[0])
-    const selectedFeatureUidFromMap = firstValue(selectedRecordAttributes, ['feature_uid', 'FEATURE_UID'])
-    const selectedBuildingFromMap = firstValue(selectedRecordAttributes, ['building', 'BUILDING'])
-    const matchingLoadedBay = activeBays.find((item) => item.featureUid === selectedFeatureUidFromMap)
+    const uniqueFeatureUids = Array.from(new Set(selectedMapTargets.map((item) => item.featureUid)))
 
-    const resolvedFeatureUid = matchingLoadedBay?.featureUid || selectedFeatureUidFromMap
-    const resolvedBuilding = matchingLoadedBay?.building || selectedBuildingFromMap
-
-    if (resolvedFeatureUid === '') {
+    if (uniqueFeatureUids.length === 0) {
       clearMessages()
-      setLiveStatus('The selected map feature does not provide feature_uid.')
+      setLiveStatus(`No selected bays with feature_uid were found in the map-linked active parking bays layer. Ignored ${missingFeatureUidCount} selected record(s) with no feature_uid.`)
       return
     }
 
-    if (resolvedBuilding === '') {
-      clearMessages()
-      setLiveStatus(`The selected map feature for feature_uid ${resolvedFeatureUid} does not provide the Parking Lot value needed by the dropdown path.`)
+    void loadBatchSelection(
+      uniqueFeatureUids,
+      {
+        contextType: 'map',
+        contextLabel: 'selected bays from map',
+        source: 'map-selected',
+        missingFeatureUidCount
+      }
+    )
+  }
+  const loadBatchSelection = async (
+    featureUids: string[],
+    options: {
+      contextType: BatchSelectionContextType
+      contextLabel: string
+      source: 'select-all' | 'map-selected' | 'post-submit-refresh'
+      missingFeatureUidCount?: number
+    }
+  ) => {
+    const trimmedFeatureUids = featureUids
+      .map((featureUid) => featureUid.trim())
+      .filter((featureUid) => featureUid !== '')
+    const uniqueFeatureUids = Array.from(new Set(trimmedFeatureUids))
+    const trimmedContextLabel = options.contextLabel.trim()
+    const missingFeatureUidCount = options.missingFeatureUidCount || 0
+
+    if (options.contextType === 'parking-lot' && trimmedContextLabel === '') {
+      setSubmitError('A Parking Lot must be selected before batch selection can proceed.')
       return
     }
 
-    activateTargetBay(resolvedFeatureUid, resolvedBuilding)
-    setLiveStatus(`Selected bay loaded from map: ${resolvedFeatureUid}`)
-    appendDebugLine(`Map-selected bay loaded. feature_uid=${resolvedFeatureUid}`)
+    if (uniqueFeatureUids.length === 0) {
+      if (options.contextType === 'map') {
+        setSubmitError('No selected bays with feature_uid were found in the map-linked active parking bays layer.')
+        return
+      }
+
+      setSubmitError(`No active bays were found in Parking Lot ${trimmedContextLabel}.`)
+      return
+    }
+
+    setSelectionMode('batch')
+    setSelectedFeatureUid('')
+    setCurrentAttributeRow(null)
+    setLoadError('')
+    setIsLoadingBatchSelection(true)
+    setBatchSelectedFeatureUids(uniqueFeatureUids)
+    setBatchCurrentRowsByFeatureUid({})
+    setBatchSelectionContextType(options.contextType)
+    setBatchSelectionContextLabel(trimmedContextLabel)
+    setBatchMissingFeatureUidCount(missingFeatureUidCount)
+    resetFormForSelectedBay()
+
+    try {
+      const rowsByFeatureUid = await queryCurrentAttributeRowsByFeatureUid(uniqueFeatureUids)
+      const summary = buildBatchSelectionSummary(
+        uniqueFeatureUids,
+        rowsByFeatureUid,
+        excludeClosedBays
+      )
+
+      setBatchCurrentRowsByFeatureUid(rowsByFeatureUid)
+      applyBatchRowsToForm(
+        summary.includedFeatureUids
+          .map((featureUid) => rowsByFeatureUid[featureUid])
+          .filter((row): row is AttributeTransactionRow => !!row)
+      )
+
+      if (options.source === 'select-all' || options.source === 'map-selected') {
+        clearMessages()
+      }
+
+      if (options.contextType === 'map') {
+        const statusParts = [`Selected ${summary.selectedCount} bays from map`]
+
+        if (missingFeatureUidCount > 0) {
+          statusParts.push(`Ignored ${missingFeatureUidCount} selected record(s) with no feature_uid`)
+        }
+
+        if (summary.includedCount === 0) {
+          statusParts.push('No included bays remain after exclusions.')
+        } else {
+          statusParts.push(`Included ${summary.includedCount}.`)
+        }
+
+        setLiveStatus(statusParts.join('. '))
+      } else {
+        if (summary.includedCount === 0) {
+          setLiveStatus(
+            `Selected ${summary.selectedCount} bays in ${trimmedContextLabel}. No included bays remain after exclusions.`
+          )
+        } else {
+          setLiveStatus(`Selected ${summary.selectedCount} bays in ${trimmedContextLabel}. Included ${summary.includedCount}.`)
+        }
+      }
+
+      if (options.contextType === 'map') {
+        appendDebugLine(`Map-selected batch target feature_uid list: ${uniqueFeatureUids.join(', ')}`)
+      } else {
+        appendDebugLine(`Batch target feature_uid list: ${uniqueFeatureUids.join(', ')}`)
+      }
+
+      if (missingFeatureUidCount > 0) {
+        appendDebugLine(`Ignored ${missingFeatureUidCount} selected record(s) with no feature_uid.`)
+      }
+
+      if (summary.noCurrentAttributeCount > 0) {
+        appendDebugLine(
+          `Excluded ${summary.noCurrentAttributeCount} bay(s) with no Current AttributeTransactions row.`
+        )
+      }
+
+      if (summary.excludedClosedCount > 0) {
+        appendDebugLine(
+          `Excluded ${summary.excludedClosedCount} non-Open bay(s) because Exclude Closed Bays is enabled.`
+        )
+      }
+    } catch (error: any) {
+      clearBatchSelection()
+      resetFormForSelectedBay()
+      setSelectionMode('single')
+      setLoadError(error?.message || 'Failed to prepare the batch selection.')
+    } finally {
+      setIsLoadingBatchSelection(false)
+    }
+  }
+  const selectAllBaysInParkingLot = () => {
+    clearMessages()
+    setLoadError('')
+
+    if (selectedBuilding.trim() === '') {
+      setSubmitError('A Parking Lot must be selected before Select All Bays can proceed.')
+      return
+    }
+
+    const targetFeatureUids = filteredBays.map((bay) => bay.featureUid)
+    void loadBatchSelection(
+      targetFeatureUids,
+      {
+        contextType: 'parking-lot',
+        contextLabel: selectedBuilding,
+        source: 'select-all'
+      }
+    )
+  }
+  const buildBatchResolvedTransactionTargets = (
+    targetFeatureUids: string[],
+    currentRowsByFeatureUid: { [key: string]: AttributeTransactionRow }
+  ): ResolvedAttributeTransactionValues[] => {
+    const resolvedTargets: ResolvedAttributeTransactionValues[] = []
+    const trimmedBaytype = baytype.trim()
+    const trimmedStatus = status.trim()
+    const trimmedParkaidZone = parkaidZone.trim()
+    const trimmedAmendReason = amendReason.trim()
+    const trimmedNotes = notes.trim()
+
+    for (const targetFeatureUid of targetFeatureUids) {
+      const currentRow = currentRowsByFeatureUid[targetFeatureUid]
+
+      if (!currentRow) {
+        throw new Error(`No Current AttributeTransactions row was found for feature_uid ${targetFeatureUid}.`)
+      }
+
+      const resolvedBaytype =
+        trimmedBaytype !== '' ? trimmedBaytype : getNormalisedText(currentRow.baytype)
+      const resolvedStatus =
+        trimmedStatus !== '' && trimmedStatus !== BATCH_STATUS_DO_NOT_CHANGE
+          ? trimmedStatus
+          : getNormalisedText(currentRow.status)
+      const resolvedParkaidZone =
+        trimmedParkaidZone !== '' ? trimmedParkaidZone : getNormalisedText(currentRow.parkaidZone)
+      const resolvedNotes = clearNoteFromTransaction
+        ? ''
+        : trimmedNotes !== ''
+          ? trimmedNotes
+          : getNormalisedText(currentRow.notes)
+
+      if (resolvedBaytype === '') {
+        throw new Error(`feature_uid ${targetFeatureUid} has no Bay Type value to carry forward.`)
+      }
+
+      if (resolvedStatus === '') {
+        throw new Error(`feature_uid ${targetFeatureUid} has no Status value to carry forward.`)
+      }
+
+      if (resolvedParkaidZone === '') {
+        throw new Error(`feature_uid ${targetFeatureUid} has no Parkaid Zone value to carry forward.`)
+      }
+
+      resolvedTargets.push({
+        featureUid: targetFeatureUid,
+        baytype: resolvedBaytype,
+        status: resolvedStatus,
+        parkaidZone: resolvedParkaidZone,
+        amendReason: trimmedAmendReason,
+        notes: resolvedNotes
+      })
+    }
+
+    return resolvedTargets
+  }
+  const batchSelectionHasActualChange = (
+    resolvedTargets: ResolvedAttributeTransactionValues[],
+    currentRowsByFeatureUid: { [key: string]: AttributeTransactionRow }
+  ): boolean => {
+    return resolvedTargets.some((resolvedTarget) => {
+      const currentRow = currentRowsByFeatureUid[resolvedTarget.featureUid]
+
+      if (!currentRow) {
+        return false
+      }
+
+      return (
+        resolvedTarget.baytype !== getNormalisedText(currentRow.baytype) ||
+        resolvedTarget.status !== getNormalisedText(currentRow.status) ||
+        resolvedTarget.parkaidZone !== getNormalisedText(currentRow.parkaidZone) ||
+        resolvedTarget.notes !== getNormalisedText(currentRow.notes)
+      )
+    })
   }
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -531,28 +871,6 @@ const Widget = (props: AllWidgetProps<any>) => {
     clearMessages()
     setLoadError('')
 
-    const trimmedFeatureUid = selectedFeatureUid.trim()
-
-    if (trimmedFeatureUid === '') {
-      setSubmitError('A selected feature_uid is required before submit can proceed.')
-      return
-    }
-
-    if (!currentAttributeRow) {
-      setSubmitError('A Current AttributeTransactions row is required before submit can proceed.')
-      return
-    }
-
-    if (baytype.trim() === '') {
-      setSubmitError('Bay Type is required before submit can proceed.')
-      return
-    }
-
-    if (status.trim() === '') {
-      setSubmitError('Status is required before submit can proceed.')
-      return
-    }
-
     if (validFrom.trim() === '') {
       setSubmitError('valid_from is required before submit can proceed.')
       return
@@ -563,49 +881,152 @@ const Widget = (props: AllWidgetProps<any>) => {
       return
     }
 
-    const editableValues = [
-      baytype.trim(),
-      status.trim(),
-      parkaidZone.trim(),
-      amendReason.trim(),
-      notes.trim()
-    ]
-
-    const hasEditableValue = editableValues.some((value) => value !== '')
-
-    if (!hasEditableValue) {
-      setSubmitError('At least one editable attribute value must be present before submit can proceed.')
-      return
-    }
-
     const transactionDateMillis = Date.now()
-    const targetFeatureUids = [trimmedFeatureUid]
 
     setIsSubmitting(true)
     setLiveStatus('Preparing attribute transaction...')
 
     try {
-      appendDebugLine(`Selected bay: ${selectedBay?.label || trimmedFeatureUid}`)
-      appendDebugLine(`Target feature_uid list: ${targetFeatureUids.join(', ')}`)
-      appendDebugLine(`Current record_id: ${currentAttributeRow.recordId}`)
+      let plan: AttributeTransactionPlan
+      let targetFeatureUids: string[] = []
+      let successTargetLabel = ''
 
-      const latestRowsByFeatureUid = await queryCurrentAttributeRowsByFeatureUid(targetFeatureUids)
+      if (selectionMode === 'batch') {
+        targetFeatureUids = [...batchSelectionSummary.includedFeatureUids]
 
-      setLiveStatus('Building transaction plan...')
+        if (targetFeatureUids.length === 0) {
+          setSubmitError('No included target bays remain after exclusions.')
+          return
+        }
 
-      const plan = buildModificationTransactionPlan(
-        targetFeatureUids,
-        latestRowsByFeatureUid,
-        {
-          baytype,
-          status,
-          parkaidZone,
+        if (batchSelectionContextType === 'parking-lot') {
+          appendDebugLine(`Selected parking lot: ${batchSelectionContextLabel}`)
+        } else {
+          appendDebugLine('Selected map batch source: active parking bays datasource selection')
+        }
+
+        appendDebugLine(`Batch target feature_uid list: ${targetFeatureUids.join(', ')}`)
+
+        const latestRowsByFeatureUid = await queryCurrentAttributeRowsByFeatureUid(targetFeatureUids)
+        const resolvedTargets = buildBatchResolvedTransactionTargets(
+          targetFeatureUids,
+          latestRowsByFeatureUid
+        )
+
+        if (!batchSelectionHasActualChange(resolvedTargets, latestRowsByFeatureUid)) {
+          setSubmitError('No actual attribute change was detected for the included target bays.')
+          return
+        }
+
+        const confirmationLines = [
+          `You are about to update ${targetFeatureUids.length} bays. Continue?`
+        ]
+
+        if (batchSelectionContextType === 'parking-lot' && batchSelectionContextLabel !== '') {
+          confirmationLines.push(`Parking Lot: ${batchSelectionContextLabel}`)
+        }
+
+        if (batchMissingFeatureUidCount > 0) {
+          confirmationLines.push(
+            `${batchMissingFeatureUidCount} selected record(s) will be ignored because they do not provide feature_uid.`
+          )
+        }
+
+        if (batchSelectionSummary.noCurrentAttributeCount > 0) {
+          confirmationLines.push(
+            `${batchSelectionSummary.noCurrentAttributeCount} bay(s) will be excluded because they have no Current AttributeTransactions row.`
+          )
+        }
+
+        if (batchSelectionSummary.excludedClosedCount > 0) {
+          confirmationLines.push(
+            `${batchSelectionSummary.excludedClosedCount} bay(s) will be excluded because Exclude Closed Bays is enabled.`
+          )
+        }
+
+        if (!window.confirm(confirmationLines.join('\n'))) {
+          setLiveStatus('Batch submit cancelled.')
+          return
+        }
+
+        setLiveStatus('Building batch transaction plan...')
+        plan = buildResolvedModificationTransactionPlan(
+          resolvedTargets,
+          latestRowsByFeatureUid,
           validFrom,
-          amendReason,
-          notes
-        },
-        transactionDateMillis
-      )
+          transactionDateMillis
+        )
+        successTargetLabel = batchSelectionContextType === 'map'
+          ? `${targetFeatureUids.length} selected bay${targetFeatureUids.length === 1 ? '' : 's'} from map`
+          : `${targetFeatureUids.length} bays in ${batchSelectionContextLabel}`
+
+        appendDebugLine(`Included target count: ${targetFeatureUids.length}`)
+        appendDebugLine(`Missing feature_uid count: ${batchMissingFeatureUidCount}`)
+        appendDebugLine(`Excluded closed count: ${batchSelectionSummary.excludedClosedCount}`)
+        appendDebugLine(`No-current-attribute count: ${batchSelectionSummary.noCurrentAttributeCount}`)
+      } else {
+        const trimmedFeatureUid = selectedFeatureUid.trim()
+
+        if (trimmedFeatureUid === '') {
+          setSubmitError('A selected feature_uid is required before submit can proceed.')
+          return
+        }
+
+        if (!currentAttributeRow) {
+          setSubmitError('A Current AttributeTransactions row is required before submit can proceed.')
+          return
+        }
+
+        if (baytype.trim() === '') {
+          setSubmitError('Bay Type is required before submit can proceed.')
+          return
+        }
+
+        if (status.trim() === '') {
+          setSubmitError('Status is required before submit can proceed.')
+          return
+        }
+
+        const editableValues = [
+          baytype.trim(),
+          status.trim(),
+          parkaidZone.trim(),
+          amendReason.trim(),
+          notes.trim()
+        ]
+
+        const hasEditableValue = editableValues.some((value) => value !== '')
+
+        if (!hasEditableValue) {
+          setSubmitError('At least one editable attribute value must be present before submit can proceed.')
+          return
+        }
+
+        targetFeatureUids = [trimmedFeatureUid]
+        successTargetLabel = selectedBay?.label || trimmedFeatureUid
+
+        appendDebugLine(`Selected bay: ${successTargetLabel}`)
+        appendDebugLine(`Target feature_uid list: ${targetFeatureUids.join(', ')}`)
+        appendDebugLine(`Current record_id: ${currentAttributeRow.recordId}`)
+
+        const latestRowsByFeatureUid = await queryCurrentAttributeRowsByFeatureUid(targetFeatureUids)
+
+        setLiveStatus('Building transaction plan...')
+
+        plan = buildModificationTransactionPlan(
+          targetFeatureUids,
+          latestRowsByFeatureUid,
+          {
+            baytype,
+            status,
+            parkaidZone,
+            validFrom,
+            amendReason,
+            notes
+          },
+          transactionDateMillis
+        )
+      }
 
       appendDebugLine(`transaction_group_id: ${plan.transactionGroupId}`)
       appendDebugLine(`New record_id: ${plan.addFeatures[0].attributes.record_id}`)
@@ -629,10 +1050,23 @@ const Widget = (props: AllWidgetProps<any>) => {
 
       await refreshActiveLayerDisplay()
       setBayRefreshToken(Date.now())
-      setCurrentRowRefreshToken(Date.now())
-      await syncMapToFeature(trimmedFeatureUid)
 
-      setSuccessSummary(`Modified parking bay attributes for ${selectedBay?.label || trimmedFeatureUid}. Rebuild completed successfully.`)
+      if (selectionMode === 'batch') {
+        await loadBatchSelection(
+          targetFeatureUids,
+          {
+            contextType: batchSelectionContextType,
+            contextLabel: batchSelectionContextLabel,
+            source: 'post-submit-refresh',
+            missingFeatureUidCount: batchMissingFeatureUidCount
+          }
+        )
+      } else {
+        setCurrentRowRefreshToken(Date.now())
+        await syncMapToFeature(targetFeatureUids[0])
+      }
+
+      setSuccessSummary(`Modified parking bay attributes for ${successTargetLabel}. Rebuild completed successfully.`)
       setLiveStatus('Complete.')
     } catch (error: any) {
       console.error('Parking bay attribute modification failed', error)
@@ -648,6 +1082,14 @@ const Widget = (props: AllWidgetProps<any>) => {
       setIsSubmitting(false)
     }
   }
+  const isBatchMode = selectionMode === 'batch'
+  const canEditBatchForm = isBatchMode
+    ? batchSelectionSummary.includedCount > 0 && !isLoadingBatchSelection
+    : selectedFeatureUid !== ''
+  const formFieldDisabled = isSubmitting || !canEditBatchForm
+  const statusOptionsForRender = isBatchMode
+    ? [BATCH_STATUS_DO_NOT_CHANGE, ...STATUS_OPTIONS]
+    : STATUS_OPTIONS
 
   if (!props.useDataSources || props.useDataSources.length < 1) {
     return (
@@ -691,7 +1133,7 @@ const Widget = (props: AllWidgetProps<any>) => {
           <span style={{ fontSize: '0.72rem', color: '#666' }}>{WIDGET_VERSION}</span>
         </div>
 
-        {(isLoadingBays || isLoadingCurrentRow) && (
+        {(isLoadingBays || isLoadingCurrentRow || isLoadingBatchSelection) && (
           <p>Loading live data...</p>
         )}
 
@@ -786,15 +1228,65 @@ const Widget = (props: AllWidgetProps<any>) => {
             <div className="mt-3">
               <button
                 type="button"
-                onClick={loadSelectedBayFromMap}
-                disabled={isSubmitting || isLoadingBays || isLoadingCurrentRow || !activeBayDs}
+                onClick={selectAllBaysInParkingLot}
+                disabled={isSubmitting || isLoadingBays || isLoadingCurrentRow || isLoadingBatchSelection || selectedBuilding === ''}
               >
-                Use Selected Bay From Map
+                Select All Bays
+              </button>
+            </div>
+
+            <div className="mt-2">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={excludeClosedBays}
+                  onChange={(event) => { setExcludeClosedBays(event.target.checked) }}
+                  disabled={isSubmitting || isLoadingBatchSelection}
+                />{' '}
+                Exclude Closed Bays
+              </label>
+            </div>
+
+            <div className="mt-3">
+              <button
+                type="button"
+                onClick={loadSelectedBayFromMap}
+                disabled={isSubmitting || isLoadingBays || isLoadingCurrentRow || isLoadingBatchSelection || !activeBayDs}
+              >
+                Use Selected Bays from Map
               </button>
             </div>
           </div>
 
-          {selectedBay && (
+          {isBatchMode && (
+            <div style={{ border: '1px solid #ddd', padding: '0.75rem', marginBottom: '1rem' }}>
+              <strong>Batch Selection</strong>
+              <div style={{ marginTop: '0.75rem' }}>
+                {batchSelectionContextType === 'map'
+                  ? `Selected ${batchSelectionSummary.selectedCount} bay${batchSelectionSummary.selectedCount === 1 ? '' : 's'} from map`
+                  : `Selected ${batchSelectionSummary.selectedCount} bay${batchSelectionSummary.selectedCount === 1 ? '' : 's'} in ${batchSelectionContextLabel || '(none)'}`}
+              </div>
+              <div>
+                Included: {batchSelectionSummary.includedCount}
+              </div>
+              <div>
+                Excluded: {batchSelectionSummary.excludedCount}
+              </div>
+              {batchSelectionContextType === 'map' && (
+                <div>
+                  Missing feature_uid: {batchMissingFeatureUidCount}
+                </div>
+              )}
+              <div>
+                No Current Attribute Row: {batchSelectionSummary.noCurrentAttributeCount}
+              </div>
+              <div>
+                Excluded Closed Bays: {batchSelectionSummary.excludedClosedCount}
+              </div>
+            </div>
+          )}
+
+          {!isBatchMode && selectedBay && (
             <div style={{ border: '1px solid #ddd', padding: '0.75rem', marginBottom: '1rem' }}>
               <strong>Current Active Bay</strong>
               <div style={{ marginTop: '0.75rem' }}>Feature UID: {selectedBay.featureUid}</div>
@@ -806,7 +1298,7 @@ const Widget = (props: AllWidgetProps<any>) => {
             </div>
           )}
 
-          {currentAttributeRow && (
+          {!isBatchMode && currentAttributeRow && (
             <div style={{ border: '1px solid #ddd', padding: '0.75rem', marginBottom: '1rem' }}>
               <strong>Current Attribute Row</strong>
               <ul style={{ marginTop: '0.75rem', marginBottom: 0, paddingLeft: '1.25rem' }}>
@@ -818,29 +1310,34 @@ const Widget = (props: AllWidgetProps<any>) => {
           )}
 
           <div className="mb-3">
-            <label htmlFor={`${props.id}-baytype`} className="d-block mb-1">{`Bay Type${REQUIRED_MARKER}`}</label>
+            <label htmlFor={`${props.id}-baytype`} className="d-block mb-1">{`Bay Type${isBatchMode ? '' : REQUIRED_MARKER}`}</label>
             <input
               id={`${props.id}-baytype`}
               className="w-100"
               type="text"
               value={baytype}
               onChange={(event) => { setBaytype(event.target.value) }}
-              disabled={selectedFeatureUid === '' || isSubmitting}
+              disabled={formFieldDisabled}
+              placeholder={isBatchMode ? 'Leave blank to carry forward each bay\'s existing Bay Type' : ''}
             />
           </div>
 
           <div className="mb-3">
-            <label htmlFor={`${props.id}-status`} className="d-block mb-1">{`Status${REQUIRED_MARKER}`}</label>
+            <label htmlFor={`${props.id}-status`} className="d-block mb-1">{`Status${isBatchMode ? '' : REQUIRED_MARKER}`}</label>
             <select
               id={`${props.id}-status`}
               className="w-100"
               value={status}
               onChange={(event) => { setStatus(event.target.value) }}
-              disabled={selectedFeatureUid === '' || isSubmitting}
+              disabled={formFieldDisabled}
             >
-              <option value="">Select status...</option>
-              {STATUS_OPTIONS.map((statusOption) => (
-                <option key={statusOption} value={statusOption}>{statusOption}</option>
+              {isBatchMode && (
+                <option value="">Mixed values - keep existing</option>
+              )}
+              {statusOptionsForRender.map((statusOption) => (
+                <option key={statusOption} value={statusOption}>
+                  {statusOption === BATCH_STATUS_DO_NOT_CHANGE ? 'Do not change' : statusOption}
+                </option>
               ))}
             </select>
           </div>
@@ -853,7 +1350,8 @@ const Widget = (props: AllWidgetProps<any>) => {
               type="text"
               value={parkaidZone}
               onChange={(event) => { setParkaidZone(event.target.value) }}
-              disabled={selectedFeatureUid === '' || isSubmitting}
+              disabled={formFieldDisabled}
+              placeholder={isBatchMode ? 'Leave blank to carry forward each bay\'s existing Parkaid Zone' : ''}
             />
           </div>
 
@@ -865,7 +1363,7 @@ const Widget = (props: AllWidgetProps<any>) => {
               type="date"
               value={validFrom}
               onChange={(event) => { setValidFrom(event.target.value) }}
-              disabled={selectedFeatureUid === '' || isSubmitting}
+              disabled={formFieldDisabled}
             />
           </div>
 
@@ -877,7 +1375,7 @@ const Widget = (props: AllWidgetProps<any>) => {
               type="text"
               value={amendReason}
               onChange={(event) => { setAmendReason(event.target.value) }}
-              disabled={selectedFeatureUid === '' || isSubmitting}
+              disabled={formFieldDisabled}
             />
           </div>
 
@@ -889,9 +1387,24 @@ const Widget = (props: AllWidgetProps<any>) => {
               rows={4}
               value={notes}
               onChange={(event) => { setNotes(event.target.value) }}
-              disabled={selectedFeatureUid === '' || isSubmitting}
+              disabled={formFieldDisabled || clearNoteFromTransaction}
+              placeholder={isBatchMode ? 'Leave blank to carry forward each bay\'s existing Notes' : ''}
             />
           </div>
+
+          {isBatchMode && (
+            <div className="mb-3">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={clearNoteFromTransaction}
+                  onChange={(event) => { setClearNoteFromTransaction(event.target.checked) }}
+                  disabled={formFieldDisabled}
+                />{' '}
+                Clear Note from Transaction
+              </label>
+            </div>
+          )}
 
           <div className="mb-3">
             <label>
@@ -909,15 +1422,13 @@ const Widget = (props: AllWidgetProps<any>) => {
             type="submit"
             disabled={
               isSubmitting ||
-              selectedBuilding === '' ||
-              selectedFeatureUid === '' ||
-              baytype.trim() === '' ||
-              status.trim() === '' ||
               validFrom.trim() === '' ||
-              currentAttributeRow === null
+              (isBatchMode
+                ? batchSelectionSummary.includedCount === 0
+                : selectedBuilding === '' || selectedFeatureUid === '' || currentAttributeRow === null)
             }
           >
-            {isSubmitting ? 'Submitting and waiting for rebuild...' : 'Modify attributes'}
+            {isSubmitting ? 'Submitting and waiting for rebuild...' : isBatchMode ? 'Modify attributes for selected bays' : 'Modify attributes'}
           </button>
         </form>
       </div>

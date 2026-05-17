@@ -56,6 +56,15 @@ export interface AttributeFormValues {
   notes: string
 }
 
+export interface ResolvedAttributeTransactionValues {
+  featureUid: string
+  baytype: string
+  status: string
+  parkaidZone: string
+  amendReason: string
+  notes: string
+}
+
 export interface AttributeTransactionAddFeature {
   attributes: {
     record_id: string
@@ -183,13 +192,13 @@ export const queryCurrentAttributeRowsByFeatureUid = async (featureUids: string[
   return rowsByFeatureUid
 }
 
-export const buildModificationTransactionPlan = (
-  targetFeatureUids: string[],
+export const buildResolvedModificationTransactionPlan = (
+  resolvedTargets: ResolvedAttributeTransactionValues[],
   currentRowsByFeatureUid: { [key: string]: AttributeTransactionRow },
-  formValues: AttributeFormValues,
+  validFrom: string,
   transactionDateMillis: number
 ): AttributeTransactionPlan => {
-  const validFromMillis = new Date(formValues.validFrom).getTime()
+  const validFromMillis = new Date(validFrom).getTime()
 
   if (Number.isNaN(validFromMillis)) {
     throw new Error('valid_from is invalid.')
@@ -199,7 +208,13 @@ export const buildModificationTransactionPlan = (
   const updateFeatures: AttributeTransactionUpdateFeature[] = []
   const transactionGroupId = buildGuid()
 
-  for (const targetFeatureUid of targetFeatureUids) {
+  for (const resolvedTarget of resolvedTargets) {
+    const targetFeatureUid = resolvedTarget.featureUid.trim()
+
+    if (targetFeatureUid === '') {
+      throw new Error('A target feature_uid is required before building the transaction plan.')
+    }
+
     const currentRow = currentRowsByFeatureUid[targetFeatureUid]
 
     if (!currentRow) {
@@ -217,9 +232,9 @@ export const buildModificationTransactionPlan = (
         record_id: newRecordId,
         transaction_group_id: transactionGroupId,
         feature_uid: targetFeatureUid,
-        baytype: normaliseNullableText(formValues.baytype),
-        status: normaliseNullableText(formValues.status),
-        parkaid_zone: normaliseNullableText(formValues.parkaidZone),
+        baytype: normaliseNullableText(resolvedTarget.baytype),
+        status: normaliseNullableText(resolvedTarget.status),
+        parkaid_zone: normaliseNullableText(resolvedTarget.parkaidZone),
         transaction_type: 'Modified',
         transaction_status: 'Current',
         transaction_date: transactionDateMillis,
@@ -227,8 +242,8 @@ export const buildModificationTransactionPlan = (
         valid_to: null,
         supersedes_record_id: currentRow.recordId,
         superseded_by_record_id: null,
-        amend_reason: normaliseNullableText(formValues.amendReason),
-        notes: normaliseNullableText(formValues.notes),
+        amend_reason: normaliseNullableText(resolvedTarget.amendReason),
+        notes: normaliseNullableText(resolvedTarget.notes),
         source_dwg: currentRow.sourceDwg
       }
     })
@@ -248,6 +263,29 @@ export const buildModificationTransactionPlan = (
     updateFeatures,
     transactionGroupId
   }
+}
+
+export const buildModificationTransactionPlan = (
+  targetFeatureUids: string[],
+  currentRowsByFeatureUid: { [key: string]: AttributeTransactionRow },
+  formValues: AttributeFormValues,
+  transactionDateMillis: number
+): AttributeTransactionPlan => {
+  return buildResolvedModificationTransactionPlan(
+    targetFeatureUids.map((targetFeatureUid) => {
+      return {
+        featureUid: targetFeatureUid,
+        baytype: formValues.baytype,
+        status: formValues.status,
+        parkaidZone: formValues.parkaidZone,
+        amendReason: formValues.amendReason,
+        notes: formValues.notes
+      }
+    }),
+    currentRowsByFeatureUid,
+    formValues.validFrom,
+    transactionDateMillis
+  )
 }
 
 export const submitAttributeTransactionPlan = async (plan: AttributeTransactionPlan): Promise<void> => {
